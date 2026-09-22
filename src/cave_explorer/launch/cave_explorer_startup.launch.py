@@ -2,7 +2,7 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, SetEnvironmentVariable
 from launch.conditions import IfCondition, LaunchConfigurationEquals
 from launch.substitutions import (Command, LaunchConfiguration,
                                   PathJoinSubstitution)
@@ -18,7 +18,17 @@ def generate_launch_description():
     config_path = os.path.join(
         get_package_share_directory('cave_explorer'),
         'config')
-    
+
+    # WSL2's GPU passthrough (WSLg, via a D3D12-backed Mesa driver) doesn't correctly
+    # support some texture operations Ignition Gazebo's Ogre2 renderer relies on, which
+    # crashes the simulator with an "Ogre::UnimplementedException" in GL3PlusTextureGpu
+    # as soon as it tries to render (i.e. the world never appears to load). Forcing
+    # software rendering avoids the broken code path. WSL2 sets WSL_DISTRO_NAME, so this
+    # only kicks in there and leaves native Linux (with working GPU drivers) untouched.
+    force_software_rendering = [
+        SetEnvironmentVariable('LIBGL_ALWAYS_SOFTWARE', '1'),
+    ] if 'WSL_DISTRO_NAME' in os.environ else []
+
     # Additional command line arguments
     use_sim_time_launch_arg = DeclareLaunchArgument(
         'use_sim_time',
@@ -150,6 +160,9 @@ def generate_launch_description():
             config_path,
             'cave_explorer.rviz')]
     )
+
+    for action in force_software_rendering:
+        ld.add_action(action)
 
     ld.add_action(use_sim_time_launch_arg)
     ld.add_action(world_launch_arg)

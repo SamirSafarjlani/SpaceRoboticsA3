@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 
 import math
+import os
 import random
+from collections import namedtuple
 from enum import Enum
 
 import cv2  # OpenCV2
+import numpy as np
 import rclpy
+import tf2_geometry_msgs
 from cv_bridge import CvBridge
-from geometry_msgs.msg import Pose, Pose2D, PoseStamped, Point
+from geometry_msgs.msg import Pose, Pose2D, PoseStamped, Point, PointStamped
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from sensor_msgs.msg import Image
+from std_srvs.srv import Trigger
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
@@ -54,6 +59,108 @@ class PlannerType(Enum):
     # Add more!
 
 
+# A single detected artifact in the current camera frame.
+# 'bbox' is (x, y, width, height) in pixel coordinates.
+# 'color_rgb' is the colour (as an (r, g, b) tuple) used to draw/label this detection.
+Detection = namedtuple('Detection', ['label', 'bbox', 'color_rgb'])
+
+# Perception 2: colour/contour-based detectors for the artefact types, other than the
+# stop sign (which is handled separately by the provided cascade classifier).
+#
+# Each profile thresholds the camera image in HSV space to find pixels that plausibly
+# belong to that artefact, then treats sufficiently large connected blobs as detections.
+# The HSV ranges below were estimated from the artefact models' base-colour textures
+# (see worlds/models/artifacts/*), so treat them as a reasonable starting point rather
+# than ground truth - re-tune them (e.g. with cv2 trackbars) against real camera frames
+# from the Perception 1 dataset, since simulated lighting will shift these colours.
+# Some artefacts (e.g. green_alien vs toy_story_alien, white_sphere vs ice_formation)
+# have deliberately similar colours and may be confused with this simple approach.
+ARTIFACT_COLOR_PROFILES = [
+    {
+        'label': 'blue_cube',
+        'hsv_lower': (100, 120, 60),
+        'hsv_upper': (125, 255, 255),
+        'min_area': 300,
+        'color_rgb': (30, 90, 255),
+    },
+    {
+        'label': 'green_crystals',
+        'hsv_lower': (42, 140, 40),
+        'hsv_upper': (70, 255, 210),
+        'min_area': 300,
+        'color_rgb': (0, 200, 0),
+    },
+    {
+        'label': 'green_alien',
+        'hsv_lower': (30, 120, 140),
+        'hsv_upper': (55, 255, 255),
+        'min_area': 300,
+        'color_rgb': (0, 255, 140),
+    },
+    {
+        'label': 'toy_story_alien',
+        'hsv_lower': (25, 120, 30),
+        'hsv_upper': (50, 255, 140),
+        'min_area': 300,
+        'color_rgb': (0, 140, 70),
+    },
+    {
+        'label': 'white_sphere',
+        'hsv_lower': (95, 30, 200),
+        'hsv_upper': (120, 140, 255),
+        'min_area': 200,
+        'color_rgb': (255, 255, 255),
+    },
+    {
+        'label': 'ice_formation',
+        'hsv_lower': (90, 20, 90),
+        'hsv_upper': (115, 130, 200),
+        'min_area': 300,
+        'color_rgb': (180, 220, 255),
+    },
+    {
+        'label': 'mossy_boulder',
+        'hsv_lower': (8, 45, 35),
+        'hsv_upper': (42, 230, 210),
+        'min_area': 400,
+        'color_rgb': (140, 90, 20),
+    },
+    {
+        'label': 'mushroom_blue',
+        'hsv_lower': (80, 40, 140),
+        'hsv_upper': (130, 180, 255),
+        'min_area': 300,
+        'color_rgb': (255, 120, 255),
+    },
+]
+
+# Lookup used to colour Perception 3's RViz markers to match each artefact's Perception 2 detection colour
+ARTIFACT_COLOR_BY_LABEL = {profile['label']: profile['color_rgb'] for profile in ARTIFACT_COLOR_PROFILES}
+
+# The RGB-D camera's colour and depth images share one sensor (single <camera> block in
+# mars_explorer.gazebo.xacro), so both use the same intrinsics computed from its resolution/FOV.
+CAMERA_WIDTH_PX = 720
+CAMERA_HEIGHT_PX = 480
+CAMERA_HORIZONTAL_FOV_RAD = 2.0944
+CAMERA_FX = (CAMERA_WIDTH_PX / 2.0) / math.tan(CAMERA_HORIZONTAL_FOV_RAD / 2.0)
+CAMERA_FY = CAMERA_FX  # assume square pixels; only the horizontal FOV is specified
+CAMERA_CX = CAMERA_WIDTH_PX / 2.0
+CAMERA_CY = CAMERA_HEIGHT_PX / 2.0
+
+# NOTE: the bridged depth image's header.frame_id is (incorrectly) 'camera_link', which is a
+# body-convention frame (x-forward/y-left/z-up) - see <gz_frame_id>camera_link</gz_frame_id> in
+# mars_explorer.gazebo.xacro. The pixel -> 3D unprojection below assumes the standard optical
+# convention (x-right/y-down/z-forward), so we transform using the *_optical_frame from the URDF
+# instead of trusting the message header, otherwise localised positions would be off by the
+# fixed -90/0/-90 rpy rotation between the two (see camera_depth_optical_joint in
+# mars_explorer.urdf.xacro).
+CAMERA_DEPTH_OPTICAL_FRAME = 'camera_depth_optical_frame'
+
+# Perception 3: repeated observations of the same artefact type within this distance (metres)
+# of an existing estimate are merged into it (running average) rather than creating a new one.
+ARTIFACT_CLUSTER_DISTANCE_M = 1.5
+
+
 class CaveExplorer(Node):
     def __init__(self):
         super().__init__('cave_explorer_node')
@@ -70,33 +177,11 @@ class CaveExplorer(Node):
         self.reached_first_artifact_ = False
         self.returned_home_ = False
 
-        # Marker for artifact locations
-        # See https://wiki.ros.org/rviz/DisplayTypes/Marker
-        self.marker_artifacts_ = Marker()
-        self.marker_artifacts_.header.frame_id = "map"
-        self.marker_artifacts_.ns = "artifacts"
-        self.marker_artifacts_.id = 0
-        self.marker_artifacts_.type = Marker.SPHERE_LIST
-        self.marker_artifacts_.action = Marker.ADD
-        self.marker_artifacts_.pose.position.x = 0.0
-        self.marker_artifacts_.pose.position.y = 0.0
-        self.marker_artifacts_.pose.position.z = 0.0
-        self.marker_artifacts_.pose.orientation.x = 0.0
-        self.marker_artifacts_.pose.orientation.y = 0.0
-        self.marker_artifacts_.pose.orientation.z = 0.0
-        self.marker_artifacts_.pose.orientation.w = 1.0
-        self.marker_artifacts_.scale.x = 1.5
-        self.marker_artifacts_.scale.y = 1.5
-        self.marker_artifacts_.scale.z = 1.5
-        self.marker_artifacts_.color.a = 1.0
-        self.marker_artifacts_.color.r = 0.0
-        self.marker_artifacts_.color.g = 1.0
-        self.marker_artifacts_.color.b = 0.2
+        # Perception 3: clustered artefact location estimates.
+        # Each entry is a dict: {'label': str, 'position': Point, 'num_observations': int}
+        # 'position' is a running average over all observations merged into this cluster.
+        self.artifact_clusters_ = []
         self.marker_pub_ = self.create_publisher(MarkerArray, 'marker_array_artifacts', 10)
-
-        # Remember the artifact locations
-        # Array of type geometry_msgs.Point
-        self.artifact_locations_ = []
 
         # Initialise CvBridge
         self.cv_bridge_ = CvBridge()
@@ -124,6 +209,27 @@ class CaveExplorer(Node):
         self.declare_parameter('computer_vision_model_filename', rclpy.Parameter.Type.STRING)
         self.computer_vision_model_ = cv2.CascadeClassifier(self.get_parameter('computer_vision_model_filename').value)
         self.image_sub_ = self.create_subscription(Image, 'camera/image', self.image_callback, 1)
+
+        # Perception 3: depth image, used to localise detected artefacts (see localise_artifacts())
+        self.latest_depth_image_ = None
+        self.depth_image_sub_ = self.create_subscription(Image, 'camera/depth/image', self.depth_image_callback, 1)
+
+        # Perception 1: dataset collection.
+        # If 'dataset_dir' is set, raw camera frames are periodically saved there (at most
+        # once every 'dataset_save_period' seconds) to build a training/test image dataset.
+        # A 'save_dataset_image' service is also provided to save the current frame on demand,
+        # e.g. while teleoperating the robot up to an artefact of interest.
+        self.declare_parameter('dataset_dir', '')
+        self.declare_parameter('dataset_save_period', 2.0)
+        self.dataset_dir_ = self.get_parameter('dataset_dir').value
+        self.dataset_save_period_ = self.get_parameter('dataset_save_period').value
+        self.last_dataset_save_time_ = self.get_clock().now()
+        self.latest_image_ = None
+        if self.dataset_dir_:
+            os.makedirs(self.dataset_dir_, exist_ok=True)
+            self.get_logger().info(f'Saving dataset images to: {self.dataset_dir_}')
+        self.save_dataset_image_srv_ = self.create_service(
+            Trigger, 'save_dataset_image', self.save_dataset_image_callback)
 
         # Timer for main loop
         self.main_loop_timer_ = self.create_timer(0.2, self.main_loop)
@@ -189,81 +295,251 @@ class CaveExplorer(Node):
         # see http://wiki.ros.org/cv_bridge/Tutorials/ConvertingBetweenROSImagesAndOpenCVImagesPython
         image = self.cv_bridge_.imgmsg_to_cv2(image_msg, desired_encoding='passthrough')
 
-        # Create a grayscale version (some simple models use this)
-        # image_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        # Remember the latest raw frame (used by the dataset-collection service below)
+        # and periodically save frames to build a Perception 1 image dataset.
+        self.latest_image_ = image
+        self.maybe_save_dataset_image(image)
 
-        # Retrieve the pre-trained model
-        stop_sign_model = self.computer_vision_model_
-
-        # Detect artifacts in the image
-        # The minSize is used to avoid very small detections that are probably noise
-        detections = stop_sign_model.detectMultiScale(image, minSize=(20,20))
+        # Perception 2: run all detectors and merge their results
+        detections = self.detect_stop_signs(image) + self.detect_color_artifacts(image)
 
         # You can set "artifact_found_" to true to signal to "main_loop" that you have found a artifact
-        # You may want to communicate more information
         # Since the "image_callback" and "main_loop" methods can run at the same time you should protect any shared variables
         # with a mutex
         # "artifact_found_" doesn't need a mutex because it's an atomic
-        num_detections = len(detections)
+        self.artifact_found_ = len(detections) > 0
 
-        if num_detections > 0:
-            self.artifact_found_ = True
-        else:
-            self.artifact_found_ = False
-
-        # Draw a bounding box rectangle on the image for each detection
-        for(x, y, width, height) in detections:
-            cv2.rectangle(image, (x, y), (x + height, y + width), (0, 255, 0), 5)
+        # Draw a bounding box + label for each detection
+        annotated_image = image.copy()
+        for detection in detections:
+            x, y, width, height = detection.bbox
+            cv2.rectangle(annotated_image, (x, y), (x + width, y + height), detection.color_rgb, 3)
+            cv2.putText(annotated_image, detection.label, (x, max(y - 8, 0)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, detection.color_rgb, 2)
 
         # Publish the image with the detection bounding boxes
-        image_detection_message = self.cv_bridge_.cv2_to_imgmsg(image, encoding="rgb8")
+        image_detection_message = self.cv_bridge_.cv2_to_imgmsg(annotated_image, encoding="rgb8")
         self.image_detections_pub_.publish(image_detection_message)
 
         if self.artifact_found_:
-            self.get_logger().info('Artifact found!')
-            self.localise_artifact()
+            self.get_logger().info(f'Artifact(s) found: {[d.label for d in detections]}')
+            self.localise_artifacts(detections)
 
+    def depth_image_callback(self, image_msg):
+        """Perception 3: remember the latest depth frame, used by localise_artifacts() below"""
 
-    def localise_artifact(self):
+        self.latest_depth_image_ = self.cv_bridge_.imgmsg_to_cv2(image_msg, desired_encoding='passthrough')
+
+    def detect_stop_signs(self, image):
         """
-        INCOMPLETE:
-        Compute the location of the artifact
-        Save it to a list, publish rviz marker
-        This version just uses the robot location rather than the artifact location
-        You can find other examples of using RViz markers in the previous assignments template code
+        Detect stop signs using the provided cascade classifier
+        (a placeholder for real artefact detection)
+        adapted from: https://www.geeksforgeeks.org/detect-an-object-with-opencv-python/
         """
 
-        # Current location of the robot
-        robot_pose = self.get_pose_2d()
+        # The minSize is used to avoid very small detections that are probably noise
+        raw_detections = self.computer_vision_model_.detectMultiScale(image, minSize=(20, 20))
 
-        if robot_pose == None:
-            self.get_logger().warn(f'localise_artifact: robot_pose is None.')
+        return [Detection('stop_sign', (x, y, w, h), (0, 255, 0))
+                for (x, y, w, h) in raw_detections]
+
+    def detect_color_artifacts(self, image):
+        """
+        Perception 2: detect the non-stop-sign artefact types using HSV colour thresholding
+        and contour/blob detection, based on ARTIFACT_COLOR_PROFILES.
+        """
+
+        hsv_image = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
+        kernel = np.ones((5, 5), np.uint8)
+
+        detections = []
+        for profile in ARTIFACT_COLOR_PROFILES:
+            mask = cv2.inRange(hsv_image, profile['hsv_lower'], profile['hsv_upper'])
+
+            # Clean up noise, then close small gaps within a single artefact's blob
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for contour in contours:
+                if cv2.contourArea(contour) < profile['min_area']:
+                    continue
+
+                bbox = cv2.boundingRect(contour)
+                detections.append(Detection(profile['label'], bbox, profile['color_rgb']))
+
+        return detections
+
+    def maybe_save_dataset_image(self, image):
+        """Perception 1: save the current frame to 'dataset_dir_' if enough time has passed"""
+
+        if not self.dataset_dir_:
             return
 
-        # Compute the location of the artifact
-        # This is currently INCOMPLETE
-        point = Point()
-        point.x = robot_pose.x
-        point.y = robot_pose.y
-        point.z = 1.0
+        elapsed = (self.get_clock().now() - self.last_dataset_save_time_).nanoseconds / 1e9
+        if elapsed < self.dataset_save_period_:
+            return
 
-        # Save it
-        self.artifact_locations_.append(point)
+        self.last_dataset_save_time_ = self.get_clock().now()
+        self.save_image_to_dataset(image)
 
-        # Publish the markers
+    def save_image_to_dataset(self, image):
+        """Perception 1: write a single frame out to 'dataset_dir_' as a timestamped PNG"""
+
+        timestamp = self.get_clock().now().nanoseconds
+        filename = os.path.join(self.dataset_dir_, f'frame_{timestamp}.png')
+
+        # image is RGB (from cv_bridge passthrough); cv2.imwrite expects BGR
+        cv2.imwrite(filename, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+        self.get_logger().info(f'Saved dataset image: {filename}')
+        return filename
+
+    def save_dataset_image_callback(self, request, response):
+        """Service to save the current frame on demand, e.g. while teleoperating up to an artefact"""
+
+        if not self.dataset_dir_:
+            response.success = False
+            response.message = "The 'dataset_dir' parameter is not set, so there's nowhere to save to"
+            return response
+
+        if self.latest_image_ is None:
+            response.success = False
+            response.message = 'No camera image received yet'
+            return response
+
+        filename = self.save_image_to_dataset(self.latest_image_)
+        response.success = True
+        response.message = f'Saved to {filename}'
+        return response
+
+    def localise_artifacts(self, detections):
+        """
+        Perception 3: estimate the world-frame (map) position of each detected artefact and
+        merge it into the running per-artefact-type location estimates in 'artifact_clusters_'.
+
+        Direction comes from the detection's pixel location, distance from the depth camera at
+        that pixel; together these unproject to a 3D point in the camera frame, which is then
+        transformed into the map frame using tf (so it accounts for the robot's current pose
+        automatically, rather than us combining robot pose + bearing by hand).
+        """
+
+        # The stop sign is a placeholder detector (see image_callback docstring), not a real
+        # artefact of interest, so it's excluded from localisation.
+        artifact_detections = [d for d in detections if d.label != 'stop_sign']
+        if not artifact_detections or self.latest_depth_image_ is None:
+            return
+
+        # Look up the camera -> map transform once and reuse it for every detection in this
+        # frame (the camera doesn't move between them). See CAMERA_DEPTH_OPTICAL_FRAME's
+        # definition above for why we use that frame name rather than the depth image's
+        # (incorrect) header.frame_id.
+        try:
+            camera_to_map_transform = self.tf_buffer.lookup_transform(
+                'map', CAMERA_DEPTH_OPTICAL_FRAME, rclpy.time.Time())
+        except TransformException as ex:
+            self.get_logger().warn(f'localise_artifacts: could not transform: {ex}')
+            return
+
+        depth_image = self.latest_depth_image_
+        depth_height, depth_width = depth_image.shape[:2]
+
+        for detection in artifact_detections:
+            x, y, width, height = detection.bbox
+            pixel_x = x + width / 2.0
+            pixel_y = y + height / 2.0
+
+            # Sample a small patch around the detection's centre pixel and take the median
+            # depth, to be robust to individual noisy/missing (inf/NaN) depth readings
+            patch_half_size = 2
+            row_lo = max(0, int(pixel_y) - patch_half_size)
+            row_hi = min(depth_height, int(pixel_y) + patch_half_size + 1)
+            col_lo = max(0, int(pixel_x) - patch_half_size)
+            col_hi = min(depth_width, int(pixel_x) + patch_half_size + 1)
+            depth_patch = depth_image[row_lo:row_hi, col_lo:col_hi]
+            valid_depths = depth_patch[np.isfinite(depth_patch) & (depth_patch > 0.0)]
+            if valid_depths.size == 0:
+                continue
+            depth = float(np.median(valid_depths))
+
+            # Unproject the pixel to a 3D point in the camera's optical frame
+            # (x-right, y-down, z-forward) using the pinhole camera model
+            point_camera = PointStamped()
+            point_camera.header.frame_id = CAMERA_DEPTH_OPTICAL_FRAME
+            point_camera.point.x = (pixel_x - CAMERA_CX) * depth / CAMERA_FX
+            point_camera.point.y = (pixel_y - CAMERA_CY) * depth / CAMERA_FY
+            point_camera.point.z = depth
+
+            point_map = tf2_geometry_msgs.do_transform_point(point_camera, camera_to_map_transform)
+            self.add_artifact_observation(detection.label, point_map.point)
+
         self.publish_artifact_markers()
 
+    def add_artifact_observation(self, label, position):
+        """
+        Perception 3: merge a new observed position for 'label' into an existing nearby cluster
+        (running average), or start a new cluster if it's not close to any existing one.
+        """
+
+        for cluster in self.artifact_clusters_:
+            if cluster['label'] != label:
+                continue
+
+            dx = position.x - cluster['position'].x
+            dy = position.y - cluster['position'].y
+            dz = position.z - cluster['position'].z
+            distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+            if distance <= ARTIFACT_CLUSTER_DISTANCE_M:
+                n = cluster['num_observations']
+                cluster['position'].x = (cluster['position'].x * n + position.x) / (n + 1)
+                cluster['position'].y = (cluster['position'].y * n + position.y) / (n + 1)
+                cluster['position'].z = (cluster['position'].z * n + position.z) / (n + 1)
+                cluster['num_observations'] += 1
+                return
+
+        self.artifact_clusters_.append({
+            'label': label,
+            'position': Point(x=position.x, y=position.y, z=position.z),
+            'num_observations': 1,
+        })
+
     def publish_artifact_markers(self):
-        """ Publish the artifact location markers"""
+        """Perception 3: publish one coloured sphere + text label per clustered artefact estimate"""
 
-        # Update the locations
-        self.marker_artifacts_.points = self.artifact_locations_
-
-        # Create and publish the MarkerArray
         marker_array = MarkerArray()
-        marker_array.markers = [self.marker_artifacts_]
-        self.marker_pub_.publish(marker_array)
+        for i, cluster in enumerate(self.artifact_clusters_):
+            color_rgb = ARTIFACT_COLOR_BY_LABEL.get(cluster['label'], (255, 255, 255))
+            color = [channel / 255.0 for channel in color_rgb]
 
+            sphere = Marker()
+            sphere.header.frame_id = 'map'
+            sphere.ns = 'artifacts'
+            sphere.id = 2 * i
+            sphere.type = Marker.SPHERE
+            sphere.action = Marker.ADD
+            sphere.pose.position = cluster['position']
+            sphere.pose.orientation.w = 1.0
+            sphere.scale.x = sphere.scale.y = sphere.scale.z = 0.6
+            sphere.color.a = 1.0
+            sphere.color.r, sphere.color.g, sphere.color.b = color
+            marker_array.markers.append(sphere)
+
+            label_text = Marker()
+            label_text.header.frame_id = 'map'
+            label_text.ns = 'artifact_labels'
+            label_text.id = 2 * i + 1
+            label_text.type = Marker.TEXT_VIEW_FACING
+            label_text.action = Marker.ADD
+            label_text.pose.position.x = cluster['position'].x
+            label_text.pose.position.y = cluster['position'].y
+            label_text.pose.position.z = cluster['position'].z + 0.5
+            label_text.pose.orientation.w = 1.0
+            label_text.scale.z = 0.4
+            label_text.color.a = 1.0
+            label_text.color.r, label_text.color.g, label_text.color.b = color
+            label_text.text = f"{cluster['label']} ({cluster['num_observations']})"
+            marker_array.markers.append(label_text)
+
+        self.marker_pub_.publish(marker_array)
 
     def planner_go_to_pose2d(self, pose2d):
         """Go to a provided 2d pose"""

@@ -13,7 +13,7 @@ As more packages are added, each new one should get its own folder under `src/`.
 Inside `src/cave_explorer/`:
 
 - `cave_explorer/cave_explorer.py` — the main ROS2 node. This is where most of the project's decision-making, perception and planning code lives.
-- `launch/` — three launch files, run together in separate terminals (see [Running the simulation](#running-the-simulation) below).
+- `launch/` — a combined launch file plus the three underlying launch files it includes (see [Running the simulation](#running-the-simulation) below).
 - `config/` — Nav2, SLAM, EKF (`robot_localization`), RViz and Gazebo topic-bridge parameters, plus the OpenCV cascade classifier used for the starter artefact detector (`stop_data.xml`).
 - `urdf/` — the rover's URDF/xacro description and meshes.
 - `worlds/` — the Gazebo cave and surface world files, plus their models/textures.
@@ -68,6 +68,16 @@ This should build without errors. If you see any errors, resolve them before pro
 
 ## Running the simulation
 
+### Quick start: one launch file
+
+```bash
+ros2 launch cave_explorer cave_explorer_all.launch.py
+```
+
+This brings up everything at once — Gazebo/RViz, SLAM + Nav2, and the autonomy node — in a single terminal. It just includes the three launch files below, so it accepts all of their arguments too (e.g. `world:=`, `odom_mode:=`, `print_feedback:=`, `dataset_dir:=` — see below). Use this unless you're actively iterating on your own code (see the tip at the end of this section).
+
+### Or: three separate launch files
+
 There are three launch files, meant to be run together, **one in each of three separate terminals** (each sourced with `source ~/ros2_ws/install/setup.bash` first). Launch them in this order, waiting for each to finish starting up before launching the next.
 
 **1. Start the simulator and visualisation:**
@@ -100,7 +110,23 @@ ros2 launch cave_explorer cave_explorer_autonomy.launch.py
 
 This runs the `cave_explorer` node (`cave_explorer/cave_explorer.py`), which contains the project's decision-making and computer-vision logic. Out of the box it detects stop signs in the camera image (as a placeholder for real artefact detection), then drives to a hardcoded location, returns home, and starts picking random goals. Pass `print_feedback:=True` to log Nav2 navigation feedback (distance remaining) to the terminal.
 
-**Tip:** while iterating on your own code, you can stop and restart the second and third launch files without restarting Gazebo, which is the slowest part to start up.
+**Tip:** while iterating on your own code, running these three separately lets you stop and restart the second and third launch files without restarting Gazebo, which is the slowest part to start up — the combined `cave_explorer_all.launch.py` doesn't offer that.
+
+### Collecting a dataset (Perception 1)
+
+The autonomy node can save camera frames to disk for building a training/test dataset of artefacts. It's off by default; enable it with the `dataset_dir` launch argument:
+
+```bash
+ros2 launch cave_explorer cave_explorer_autonomy.launch.py dataset_dir:=/home/$USER/cave_dataset
+```
+
+This saves a frame at most once every `dataset_save_period` seconds (default `2.0`) to `dataset_dir` as `frame_<timestamp>.png`. You can also save the current frame on demand at any time (e.g. while lining up a good shot of an artefact with `teleop_twist_keyboard`) by calling:
+
+```bash
+ros2 service call /save_dataset_image std_srvs/srv/Trigger {}
+```
+
+Drive the robot around (random walk/goals, waypoints, or teleop — see Perception 1 in the project brief) while this is running, then sort the saved images into per-artefact-type folders afterwards.
 
 ## Development notes
 
